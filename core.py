@@ -8,6 +8,7 @@ run_agent_mixed() — local Ollama orchestrates; routes complex tasks to a remot
 from __future__ import annotations
 
 import json
+import re
 
 from providers import LLMProvider, LLMMessage
 from tools import TOOL_SCHEMAS, call_tool
@@ -106,6 +107,17 @@ def run_agent(
     recent_calls: list[tuple[str, str]] = []
     _REPEAT_ABORT = 3  # same call N times in the window → abort
 
+    # Stage 2 of the loop breaker: track the last *result string* for
+    # run_command. If we just told the agent "everything is up to date"
+    # (or "auth failed", etc.) and it issues another run_command whose
+    # output looks the same, abort — this catches the case where the
+    # exact command string differs but the semantic action is identical
+    # (e.g. `git push`, then `git push origin HEAD`, both succeed with
+    # "Everything up-to-date"). Strict matching would miss this; we use a
+    # small fingerprint of "exit code + first 60 chars of stdout".
+    last_run_cmd_fingerprints: list[tuple[int, str]] = []
+    _FINGERPRINT_ABORT = 3  # same fingerprint 3x in a row → abort
+
     while True:
         if spinner:
             spinner.start("Thinking…")
@@ -167,6 +179,53 @@ def run_agent(
             finally:
                 if spinner:
                     spinner.stop()
+
+            # Stage 2 fingerprint check (only for run_command results):
+            # if the agent re-issues a run_command and we already saw
+            # the same exit-code + first-60-chars in the previous turn,
+            # treat this as a redundant repeat even if the literal args
+            # differ. This catches semantically-identical retries like
+            # `git push` followed by `git push origin HEAD`, both of
+            # which produce "Everything up-to-date".
+            if tc.name == "run_command":
+                result_str = str(result)
+                # Footer is at the END of the string, not the start.
+                # Allow optional "(no output) " prefix on a single-line result.
+                m = re.search(
+                    r"(?:\(no output\) )?\[exit=(\d+)(?: http=(\d+))?(?: hint=([^\]]+))?\]\s*$",
+                    result_str,
+                )
+                exit_code = int(m.group(1)) if m else -1
+                # Combine: exit code + a stable head of the actual output
+                # (first 60 chars of the body, stripping the trailing footer).
+                body = result_str[:60]
+                fp = (exit_code, body)
+                last_run_cmd_fingerprints.append(fp)
+                if len(last_run_cmd_fingerprints) > _FINGERPRINT_ABORT:
+                    last_run_cmd_fingerprints.pop(0)
+                if (
+                    len(last_run_cmd_fingerprints) >= _FINGERPRINT_ABORT
+                    and last_run_cmd_fingerprints[-_FINGERPRINT_ABORT:] == [fp] * _FINGERPRINT_ABORT
+                ):
+                    err = (
+                        f"Loop detected: {_FINGERPRINT_ABORT} consecutive "
+                        f"run_command calls produced the same result "
+                        f"(exit={exit_code}, same opening text). Last result "
+                        f"was: {result_str[:200]}. Stop re-running the same "
+                        f"command — the previous attempts already finished "
+                        f"and repeating will not change the outcome. If the "
+                        f"situation has changed, change the command "
+                        f"(different arguments, different working directory, "
+                        f"or a different tool)."
+                    )
+                    if spinner:
+                        spinner.println(f"  ✗ fingerprint loop aborted: run_command")
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc.id,
+                        "content": f"Error: {err}",
+                    })
+                    continue
 
             if spinner:
                 result_preview = str(result)
