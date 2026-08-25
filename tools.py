@@ -8,12 +8,35 @@ Add your own tools here:
 """
 
 import datetime as _dt
+import shlex
+import subprocess
 from datetime import datetime
 from pathlib import Path
 
 _MCP_SERVER = str(Path(__file__).parent / "mcp_server.py")
 
 _WORKSPACE = Path("workspace")
+
+# `run_command` safety configuration.
+#
+# FULLY OPEN MODE (user request: "完全裸奔" / "全部放开").
+# - _ALLOWED_CMD_PREFIXES = None: no whitelist, any command runs.
+# - _BLOCKED_SUBSTRINGS = (): no substring block either.
+# - run_command passes the raw string to /bin/sh -c (shell=True).
+#
+# The ONLY remaining guards are:
+#   * `_RUN_CMD_TIMEOUT_S` — command will be killed after N seconds.
+#   * `_RUN_CMD_MAX_OUTPUT_CHARS` — output is truncated.
+# That's it. Everything else is on the model's honesty.
+#
+# !! Implication: the model can run any shell snippet, including ones that
+# !! exfiltrate credentials, install backdoors, or destroy data. Treat any
+# !! prompt-injected content as live shell.
+_ALLOWED_CMD_PREFIXES: tuple[str, ...] | None = None
+_BLOCKED_SUBSTRINGS: tuple[str, ...] = ()
+
+_RUN_CMD_TIMEOUT_S = 30
+_RUN_CMD_MAX_OUTPUT_CHARS = 8000
 
 
 def _safe_path(relative_path: str) -> Path:
@@ -103,17 +126,7 @@ def web_search(query: str) -> str:
 
 
 # --- Registry: name → callable ---
-
-TOOL_FUNCTIONS: dict = {
-    "get_current_date": get_current_date,
-    "calculate": calculate,
-    "get_weather": get_weather,
-    "web_search": web_search,
-    "read_file": read_file,
-    "write_file": write_file,
-    "to_uppercase": mcp_to_uppercase,
-    "count_words": mcp_count_words,
-}
+# (defined after run_command to avoid forward reference)
 
 
 # --- Schemas (OpenAI function-calling format) ---
@@ -229,7 +242,123 @@ TOOL_SCHEMAS: list[dict] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_command",
+            "description": (
+                "Run a shell command and return its stdout+stderr. "
+                "No shell — command is parsed with shlex and run via execvp. "
+                "The first token must be in the safety whitelist "
+                "(ls, cat, grep, python, git, curl, etc.); known-destructive "
+                "patterns are blocked. Default timeout 30s. "
+                "Output is truncated to 8000 chars. "
+                "Use this when no dedicated tool fits (e.g. listing files, "
+                "counting lines, inspecting git status, fetching a URL)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": (
+                            "Shell command to run, e.g. 'ls -la' or "
+                            "'git status'. Do not use && or | to chain — "
+                            "call run_command multiple times if needed."
+                        ),
+                    },
+                    "timeout": {
+                        "type": "integer",
+                        "description": "Optional timeout in seconds (default 30, max 300).",
+                    },
+                },
+                "required": ["command"],
+            },
+        },
+    },
 ]
+
+
+def _shell_safe(argv: list[str]) -> tuple[bool, str]:
+    """Return (ok, reason). Fully open mode — only reject empty input."""
+    if not argv:
+        return False, "empty command"
+    if _ALLOWED_CMD_PREFIXES is not None:
+        head = argv[0]
+        if head not in _ALLOWED_CMD_PREFIXES:
+            return False, (
+                f"command '{head}' is not in the whitelist. "
+                f"Allowed prefixes: {', '.join(_ALLOWED_CMD_PREFIXES)}"
+            )
+    full = " ".join(argv)
+    low = full.lower()
+    for bad in _BLOCKED_SUBSTRINGS:
+        if bad in low:
+            return False, f"command contains blocked pattern '{bad}'"
+    return True, ""
+
+
+def run_command(command: str, timeout: int | None = None) -> str:
+    """
+    Run a shell command and return its combined stdout+stderr.
+
+    !! FULLY OPEN MODE — no whitelist, no substring block. The `command`
+    !! string is passed verbatim to `/bin/sh -c`, so pipes, redirects,
+    !! `&&` chains, env-var expansion, globbing, command substitution,
+    !! and background jobs all work. Only remaining guards are a wall-clock
+    !! timeout and output-length truncation.
+
+    Args:
+        command: Shell command line (passed to `/bin/sh -c`).
+        timeout: Seconds before the command is killed (default
+                 `_RUN_CMD_TIMEOUT_S`). Pass a larger value for long ops.
+
+    The command runs in the current working directory (typically the project
+    root, not inside `workspace/`). Pass `cd workspace && ...` if needed.
+    """
+    ok, reason = _shell_safe([command])
+    if not ok:
+        return f"Error: {reason}"
+
+    try:
+        completed = subprocess.run(
+            command,
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=timeout if timeout is not None else _RUN_CMD_TIMEOUT_S,
+        )
+    except subprocess.TimeoutExpired:
+        return f"Error: command timed out after {timeout or _RUN_CMD_TIMEOUT_S}s"
+    except Exception as e:
+        return f"Error: {e}"
+
+    out = (completed.stdout or "") + (completed.stderr or "")
+    if len(out) > _RUN_CMD_MAX_OUTPUT_CHARS:
+        out = (
+            out[:_RUN_CMD_MAX_OUTPUT_CHARS]
+            + f"\n... [truncated, total {len(out)} chars]"
+        )
+    rc = completed.returncode
+    if not out:
+        return f"(no output) exit={rc}"
+    return f"{out.rstrip()}\n[exit={rc}]"
+
+
+# --- Registry: name → callable ---
+# (defined after run_command to avoid forward reference)
+
+TOOL_FUNCTIONS: dict = {
+    "get_current_date": get_current_date,
+    "calculate": calculate,
+    "get_weather": get_weather,
+    "web_search": web_search,
+    "read_file": read_file,
+    "write_file": write_file,
+    "run_command": run_command,
+    "to_uppercase": mcp_to_uppercase,
+    "count_words": mcp_count_words,
+}
 
 
 def call_tool(name: str, arguments: dict) -> str:
