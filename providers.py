@@ -5,7 +5,8 @@ Supported providers:
   - openai   : OpenAI API (gpt-4o-mini, gpt-4o, o1, ...)
   - anthropic : Anthropic API (claude-haiku-4-5-20251001, claude-sonnet-4-6, ...)
   - gemini    : Google Gemini via its OpenAI-compatible endpoint
-  - ollama    : Local models via Ollama (llama3.1, qwen2.5, mistral-nemo, ...)
+    - ollama    : Local models via Ollama (llama3.1, qwen2.5, mistral-nemo, ...)
+    - minimax   : MiniMax (MiniMax-M3) via its OpenAI-compatible endpoint
 
 All providers share the same interface: .complete(messages, tools) → LLMMessage.
 Messages are kept in canonical (OpenAI-style) dicts throughout; each provider
@@ -264,6 +265,7 @@ _DEFAULTS: dict[str, str] = {
     "anthropic": "claude-haiku-4-5-20251001",
     "gemini": "gemini-2.0-flash",
     "ollama": "qwen2.5",
+    "minimax": "MiniMax-M3",
 }
 
 
@@ -271,7 +273,7 @@ def create_provider(provider: str, model: str | None = None) -> LLMProvider:
     """
     Create an LLM provider by name.
 
-    provider: "openai" | "anthropic" | "gemini" | "ollama"
+    provider: "openai" | "anthropic" | "gemini" | "ollama" | "minimax"
     model:    model name (uses a sensible default if omitted)
     """
     model = model or _DEFAULTS.get(provider, "")
@@ -301,9 +303,16 @@ def create_provider(provider: str, model: str | None = None) -> LLMProvider:
             base_url="http://localhost:11434/v1",
             label="ollama",
         )
+    if provider == "minimax":
+        return OpenAICompatProvider(
+            api_key=_require_env("MINIMAX_API_KEY"),
+            model=model,
+            base_url=os.environ.get("MINIMAX_BASE_URL", "https://api.minimaxi.com/v1"),
+            label="minimax",
+        )
 
     raise ValueError(
-        f"Unknown provider '{provider}'. Choose from: openai, anthropic, gemini, ollama"
+        f"Unknown provider '{provider}'. Choose from: openai, anthropic, gemini, ollama, minimax"
     )
 
 

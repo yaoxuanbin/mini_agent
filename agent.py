@@ -67,7 +67,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--provider",
-        choices=["openai", "anthropic", "gemini"],
+        choices=["openai", "anthropic", "gemini", "minimax"],
         default="openai",
         dest="remote_provider",
         help="Cloud provider for remote/mixed mode (default: openai)",
@@ -79,7 +79,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         metavar="MODEL",
         help=(
             "Cloud model name. Defaults: "
-            "openai→gpt-4o-mini, anthropic→claude-haiku-4-5-20251001, gemini→gemini-2.0-flash"
+             "openai→gpt-4o-mini, anthropic→claude-haiku-4-5-20251001, gemini→gemini-2.0-flash, minimax→MiniMax-M3"
         ),
     )
     p.add_argument(
