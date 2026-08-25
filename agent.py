@@ -37,6 +37,35 @@ from providers import create_provider, LLMProvider
 from core import run_agent, run_agent_mixed
 from reliability import run_agent_reliable, run_agent_with_fallback
 
+try:
+    from prompt_toolkit import prompt as _pt_prompt
+    from prompt_toolkit.history import InMemoryHistory
+    _PT_AVAILABLE = True
+except ImportError:
+    _PT_AVAILABLE = False
+
+
+def _read_task(prompt_text: str = "You: ") -> str:
+    """
+    Read a single line of user input with line editing support.
+
+    Uses prompt_toolkit when available (handles backspace, arrow keys, history
+    navigation, Chinese IME correctly on Termux/Alpine proot). Falls back to
+    the built-in input() otherwise.
+    """
+    if _PT_AVAILABLE:
+        try:
+            return _pt_prompt(prompt_text).strip()
+        except (EOFError, KeyboardInterrupt):
+            raise
+    try:
+        return input(prompt_text).strip()
+    except EOFError:
+        # input() raises EOFError on EOF; prompt_toolkit also surfaces EOF as
+        # EOFError, but only when stdin is exhausted. Translate to a clean
+        # Ctrl-C-like break.
+        raise KeyboardInterrupt
+
 
 _BANNER = """\
 ╔══════════════════════════════════════════╗
@@ -88,6 +117,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Start an interactive REPL session instead of running a single task",
     )
     p.add_argument(
+        "--no-history",
+        action="store_true",
+        help="In --interactive mode, do not remember previous turns (each turn "
+             "is independent; matches the original behaviour before session "
+             "memory was added)",
+    )
+    p.add_argument(
         "--quiet", "-q",
         action="store_true",
         help="Suppress tool call trace output",
@@ -118,16 +154,29 @@ def _describe_mode(args, local: LLMProvider | None, remote: LLMProvider | None) 
     return f"mixed  →  local: {local}  |  remote: {remote}"
 
 
-def run_task(task: str, args, local: LLMProvider | None, remote: LLMProvider | None) -> str:
+def run_task(
+    task: str,
+    args,
+    local: LLMProvider | None,
+    remote: LLMProvider | None,
+    history: list[dict] | None = None,
+) -> tuple[str, list[dict]]:
+    """
+    Run a single turn. Returns (answer, updated_history).
+
+    updated_history is the conversation so far (without the system prompt),
+    ready to be fed back into the next call. None when the caller does not
+    need history (e.g. one-shot CLI mode).
+    """
     verbose = not args.quiet
     if args.mode == "local":
         if args.fallback:
             providers = [local] + [create_provider("ollama", m) for m in args.fallback]
-            return run_agent_with_fallback(task, providers, verbose=verbose)
-        return run_agent_reliable(task, local, verbose=verbose)
+            return run_agent_with_fallback(task, providers, verbose=verbose, history=history)
+        return run_agent_reliable(task, local, verbose=verbose, history=history)
     if args.mode == "remote":
-        return run_agent_reliable(task, remote, verbose=verbose)
-    return run_agent_mixed(task, local, remote, verbose=verbose)
+        return run_agent_reliable(task, remote, verbose=verbose, history=history)
+    return run_agent_mixed(task, local, remote, verbose=verbose, history=history)
 
 
 def main() -> None:
@@ -161,7 +210,7 @@ def main() -> None:
         task = " ".join(args.task)
         print(f"Task: {task}\n")
         try:
-            answer = run_task(task, args, local, remote)
+            answer, _history = run_task(task, args, local, remote)
             print(f"\nAnswer: {answer}\n")
         except KeyboardInterrupt:
             print("\nInterrupted.")
@@ -173,24 +222,50 @@ def main() -> None:
 
 def _repl(args, local: LLMProvider | None, remote: LLMProvider | None) -> None:
     print("Interactive mode. Type your task and press Enter.")
-    print("Commands: 'exit' or Ctrl+C to quit.\n")
+    if _PT_AVAILABLE:
+        print("Line editing: backspace, arrow keys, ↑/↓ history.")
+    print("Commands: 'exit' / 'quit' / Ctrl+C to quit, '/clear' to reset history.\n")
+
+    # Accumulated conversation: list of {role, content/tool_calls/...} dicts
+    # WITHOUT the system prompt (run_agent injects the system prompt each turn).
+    history: list[dict] = []
+    keep_history = not args.no_history
+    if not keep_history:
+        print("(history disabled — use --no-history to suppress this message)\n")
+
+    # prompt_toolkit input history is separate from conversation history;
+    # ↑/↓ recalls commands, not LLM turns.
+    pt_history = InMemoryHistory() if _PT_AVAILABLE else None
 
     while True:
         try:
-            task = input("You: ").strip()
+            if _PT_AVAILABLE:
+                task = _pt_prompt("You: ", history=pt_history).strip()
+            else:
+                task = input("You: ").strip()
         except (KeyboardInterrupt, EOFError):
             print("\nGoodbye.")
             break
+        except Exception as e:
+            print(f"\nInput error: {e}\n")
+            continue
 
         if task.lower() in ("exit", "quit", "q", ":q"):
             print("Goodbye.")
             break
+        if task == "/clear":
+            history = []
+            print("[history cleared]\n")
+            continue
         if not task:
             continue
 
         print()
         try:
-            answer = run_task(task, args, local, remote)
+            answer, history = run_task(
+                task, args, local, remote,
+                history=history if keep_history else None,
+            )
             print(f"\nAgent: {answer}\n")
         except Exception as e:
             print(f"Error: {e}\n")

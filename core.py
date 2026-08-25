@@ -63,7 +63,8 @@ def run_agent(
     verbose: bool = True,
     tool_dispatcher=None,
     _spinner: Spinner | None = None,
-) -> str:
+    history: list[dict] | None = None,
+) -> tuple[str, list[dict]]:
     """
     Core agent loop.
 
@@ -74,16 +75,26 @@ def run_agent(
                      tools (e.g. ask_remote in mixed mode).
     _spinner: caller-supplied Spinner; run_agent_mixed passes its own so that
               ask_remote() can update the same spinner line.
+    history: prior conversation messages to prepend (without system prompt or
+             current task). Returned alongside the final answer so the caller
+             can keep the conversation going across turns.
+
+    Returns:
+        (final_answer, full_messages) — full_messages is the complete message
+        history including the system prompt, history, current turn, any tool
+        calls/results, and the final assistant reply. The caller should slice
+        off the system prompt (i.e. full_messages[1:]) when feeding it back
+        as history on the next turn.
     """
     if tools is None:
         tools = TOOL_SCHEMAS
 
     spinner: Spinner | None = (_spinner or Spinner()) if verbose else None
 
-    messages: list[dict] = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": task},
-    ]
+    messages: list[dict] = [{"role": "system", "content": system_prompt}]
+    if history:
+        messages.extend(history)
+    messages.append({"role": "user", "content": task})
 
     while True:
         if spinner:
@@ -97,7 +108,7 @@ def run_agent(
         messages.append(response.to_dict())
 
         if not response.tool_calls:
-            return response.content or ""
+            return response.content or "", messages
 
         dispatch = tool_dispatcher or call_tool
 
@@ -133,7 +144,8 @@ def run_agent_mixed(
     local_provider: LLMProvider,
     remote_provider: LLMProvider,
     verbose: bool = True,
-) -> str:
+    history: list[dict] | None = None,
+) -> tuple[str, list[dict]]:
     """
     Mixed-mode agent loop.
 
@@ -161,4 +173,32 @@ def run_agent_mixed(
         system_prompt=_SYSTEM_MIXED,
         verbose=verbose,
         _spinner=spinner,
+        history=history,
     )
+
+
+def run_agent_with_history(
+    task: str,
+    provider: LLMProvider,
+    history: list[dict] | None = None,
+    tools: list[dict] | None = None,
+    extra_functions: dict | None = None,
+    system_prompt: str = _SYSTEM_DEFAULT,
+    verbose: bool = True,
+) -> tuple[str, list[dict]]:
+    """
+    Convenience wrapper for conversation-style usage: feeds history in, gets
+    history back (already stripped of the system prompt). Equivalent to
+    calling run_agent(..., history=history) and slicing full_messages[1:].
+    """
+    answer, full_messages = run_agent(
+        task=task,
+        provider=provider,
+        tools=tools,
+        extra_functions=extra_functions,
+        system_prompt=system_prompt,
+        verbose=verbose,
+        history=history,
+    )
+    # Drop the system prompt before handing the conversation back.
+    return answer, full_messages[1:]

@@ -211,13 +211,17 @@ def run_agent_reliable(
     llm_max_retries: int = 5,
     circuit_failure_threshold: int = 3,
     circuit_reset_timeout: float = 30.0,
-) -> str:
+    history: list[dict] | None = None,
+) -> tuple[str, list[dict]]:
     """
     run_agent() with retry, circuit breaker, schema validation, and tracing
     applied to every tool call. Drop-in replacement for run_agent().
 
     llm_max_retries: retries on the LLM call itself (network drops, 503s, etc.)
     max_retries:     retries on individual tool calls
+    history:         prior conversation messages (without system prompt) to
+                     prepend. Returned alongside the final answer so the
+                     caller can continue the conversation.
     """
     breakers: dict[str, CircuitBreaker] = defaultdict(
         lambda: CircuitBreaker(
@@ -232,6 +236,7 @@ def run_agent_reliable(
         system_prompt=system_prompt,
         verbose=verbose,
         tool_dispatcher=_make_dispatcher(breakers, max_retries),
+        history=history,
     )
 
 
@@ -283,7 +288,8 @@ def run_agent_with_fallback(
     max_retries: int = 2,
     circuit_failure_threshold: int = 3,
     circuit_reset_timeout: float = 30.0,
-) -> str:
+    history: list[dict] | None = None,
+) -> tuple[str, list[dict]]:
     """
     Try providers in order, falling back to the next on exception or unstructured output.
 
@@ -305,10 +311,11 @@ def run_agent_with_fallback(
                 max_retries=max_retries,
                 circuit_failure_threshold=circuit_failure_threshold,
                 circuit_reset_timeout=circuit_reset_timeout,
+                history=history,
             )
-            if _looks_like_failed_tool_call(result):
+            if _looks_like_failed_tool_call(result[0]):
                 raise RuntimeError(
-                    f"{provider} did not use structured tool calling — got: {result[:80]!r}"
+                    f"{provider} did not use structured tool calling — got: {result[0][:80]!r}"
                 )
             return result
         except Exception as e:
