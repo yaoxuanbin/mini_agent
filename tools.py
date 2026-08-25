@@ -8,6 +8,7 @@ Add your own tools here:
 """
 
 import datetime as _dt
+import re
 import shlex
 import subprocess
 from datetime import datetime
@@ -308,6 +309,15 @@ def run_command(command: str, timeout: int | None = None) -> str:
     !! and background jobs all work. Only remaining guards are a wall-clock
     !! timeout and output-length truncation.
 
+    Output is annotated with an exit-code footer so the agent can tell
+    success from failure:
+      `[exit=N]` — N is the process return code (0 = success).
+    For `curl` calls (the main culprit for silent 4xx/5xx), the HTTP status
+    code is also surfaced: `[exit=N http=403]`. This is critical for breaking
+    out of repeat-call loops where the agent re-issues the same `curl` after
+    hitting a rate limit or 404 — a JSON error body looks like a successful
+    answer to the model otherwise.
+
     Args:
         command: Shell command line (passed to `/bin/sh -c`).
         timeout: Seconds before the command is killed (default
@@ -340,9 +350,58 @@ def run_command(command: str, timeout: int | None = None) -> str:
             + f"\n... [truncated, total {len(out)} chars]"
         )
     rc = completed.returncode
+
+    # Detect curl invocations so we can surface HTTP status codes. `curl -s`
+    # silently exits 0 on 4xx/5xx — without this hint, the agent has no way
+    # to distinguish a successful JSON response from a rate-limit error body.
+    http_code = None
+    if rc == 0 and re.search(r"(^|\s|;|&)curl(\s|$)", command):
+        # Prefer an explicit -w '%{http_code}' if the user already asked for
+        # one; otherwise re-run once silently with -o /dev/null to extract it.
+        # We only do this on success to keep behaviour predictable.
+        m = re.search(r"-w\s+['\"]?[^'\"]*%\{http_code\}[^'\"]*['\"]?", command)
+        if m:
+            # The user's own -w template already produced http_code in stdout.
+            # Don't re-invoke; just look for a 3-digit code at end of stdout.
+            tail = (completed.stdout or "").strip().splitlines()
+            if tail and tail[-1].strip().isdigit() and len(tail[-1].strip()) == 3:
+                http_code = tail[-1].strip()
+        else:
+            try:
+                probe = subprocess.run(
+                    f"{command} -o /dev/null -w '%{{http_code}}'",
+                    shell=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                code = (probe.stdout or "").strip()
+                if code.isdigit():
+                    http_code = code
+            except Exception:
+                pass
+
+    # Common 4xx/5xx markers in body — flag even when we couldn't get http_code.
+    error_hint = None
+    if rc == 0:
+        body_low = out.lower()
+        if "rate limit exceeded" in body_low:
+            error_hint = "github_api_rate_limit"
+        elif "not found" in body_low and '"message"' in body_low:
+            error_hint = "not_found"
+        elif http_code and http_code.startswith(("4", "5")):
+            error_hint = f"http_{http_code}"
+
+    parts = [f"exit={rc}"]
+    if http_code:
+        parts.append(f"http={http_code}")
+    if error_hint:
+        parts.append(f"hint={error_hint}")
+    footer = "[" + " ".join(parts) + "]"
+
     if not out:
-        return f"(no output) exit={rc}"
-    return f"{out.rstrip()}\n[exit={rc}]"
+        return f"(no output) {footer}"
+    return f"{out.rstrip()}\n{footer}"
 
 
 # --- Registry: name → callable ---

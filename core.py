@@ -7,6 +7,8 @@ run_agent_mixed() — local Ollama orchestrates; routes complex tasks to a remot
 
 from __future__ import annotations
 
+import json
+
 from providers import LLMProvider, LLMMessage
 from tools import TOOL_SCHEMAS, call_tool
 from ui import Spinner
@@ -96,6 +98,14 @@ def run_agent(
         messages.extend(history)
     messages.append({"role": "user", "content": task})
 
+    # Loop breaker: if the agent issues the same (tool, args) repeatedly,
+    # short-circuit with an error instead of letting it run forever.
+    # We compare the canonicalised JSON of arguments so trivial whitespace
+    # differences don't evade the check.
+    _RECENT_LIMIT = 4  # last N successful tool calls to remember
+    recent_calls: list[tuple[str, str]] = []
+    _REPEAT_ABORT = 3  # same call N times in the window → abort
+
     while True:
         if spinner:
             spinner.start("Thinking…")
@@ -114,6 +124,38 @@ def run_agent(
 
         for tc in response.tool_calls:
             args_str = _fmt_args(tc.arguments)
+
+            # Loop-breaker check: identical call repeated too often?
+            try:
+                args_key = json.dumps(tc.arguments, sort_keys=True, ensure_ascii=False)
+            except (TypeError, ValueError):
+                args_key = repr(tc.arguments)
+            sig = (tc.name, args_key)
+            recent_calls.append(sig)
+            if len(recent_calls) > _RECENT_LIMIT:
+                recent_calls.pop(0)
+            if (
+                len(recent_calls) >= _REPEAT_ABORT
+                and recent_calls[-_REPEAT_ABORT:] == [sig] * _REPEAT_ABORT
+            ):
+                err = (
+                    f"Loop detected: '{tc.name}' was called with identical "
+                    f"arguments {_REPEAT_ABORT} times in a row. The previous "
+                    f"result was: {str(result)[:200]}. Stop calling this tool "
+                    f"with the same arguments and either change the arguments, "
+                    f"try a different tool, or answer with what you already have."
+                )
+                if spinner:
+                    spinner.println(f"  ✗ loop aborted: {tc.name} repeated {_REPEAT_ABORT}x")
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": f"Error: {err}",
+                })
+                # Force the loop to continue so the agent gets one final
+                # chance to reformulate — but if it tries again identically
+                # the check above will keep triggering, so it has to change.
+                continue
 
             if spinner:
                 spinner.start(f"{tc.name}({args_str})")
